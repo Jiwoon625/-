@@ -17,8 +17,8 @@ import xgboost as xgb
 # ───────────────────────────
 # 페이지 설정 (가장 먼저 호출)
 # ───────────────────────────
-st.set_page_config(page_title="전세 보증금 예측", layout="wide")
-st.title("전세 보증금 예측")
+st.set_page_config(page_title="적정 전세 보증금 예측", layout="wide")
+st.title("적정 전세 보증금 예측")
 
 # ───────────────────────────
 # 모델 다운로드 설정 (GitHub Releases)
