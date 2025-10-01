@@ -1,20 +1,64 @@
 # -*- coding: utf-8 -*-
-import json
-import math
+# app.py
 from datetime import date
-import requests
-import pandas as pd
-import numpy as np
-import streamlit as st
 from io import StringIO
-import hashlib
+from pathlib import Path
+import gzip, json, shutil, math
 
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 from streamlit_folium import st_folium
 import folium
 from folium.plugins import MarkerCluster
 import xgboost as xgb
 
+# ───────────────────────────
+# 페이지 설정 (가장 먼저 호출)
+# ───────────────────────────
 st.set_page_config(page_title="전세 보증금 예측", layout="wide")
+st.title("전세 보증금 예측")
+
+# ───────────────────────────
+# 모델 다운로드 설정 (GitHub Releases)
+# ───────────────────────────
+MODEL_URL = "https://github.com/Jiwoon625/jeonse/releases/download/v1.0.2/jeonse_gbm_xgb.ubj.gz"
+MODEL_DIR = Path("models"); MODEL_DIR.mkdir(exist_ok=True)
+GZ_PATH = MODEL_DIR / "jeonse_gbm_xgb.ubj.gz"
+UBJ_PATH = MODEL_DIR / "jeonse_gbm_xgb.ubj"
+
+def _download_if_needed():
+    if not GZ_PATH.exists() or GZ_PATH.stat().st_size == 0:
+        with st.status("모델 다운로드 중...", expanded=False) as s:
+            with requests.get(MODEL_URL, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                tmp = GZ_PATH.with_suffix(".part")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(1024*1024):
+                        if chunk: f.write(chunk)
+                tmp.replace(GZ_PATH)
+            s.update(label="다운로드 완료", state="complete")
+
+    if not UBJ_PATH.exists() or UBJ_PATH.stat().st_size == 0:
+        with gzip.open(GZ_PATH, "rb") as fin, open(UBJ_PATH, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+
+@st.cache_resource
+def load_model() -> xgb.Booster:
+    _download_if_needed()
+    bst = xgb.Booster()
+    bst.load_model(str(UBJ_PATH))
+    return bst
+
+def get_feature_names_from_booster(bst: xgb.Booster):
+    if getattr(bst, "feature_names", None):
+        return list(bst.feature_names)
+    for side in ["jeonse_gbm_xgb.flist", "jeonse_gbm_xgb.features.txt", "jeonse_gbm_features.csv"]:
+        p = Path(side)
+        if p.exists():
+            return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return None
 
 STATION_CSV = r"""name,line,lat,lon
 동탄,수도권 광역급행철도,37.20034,127.09569
@@ -798,7 +842,8 @@ STATION_CSV = r"""name,line,lat,lon
 시청,1호선,37.565715,126.977088
 서울역,1호선,37.556228,126.972135
 """
-def load_station_master_from_embedded():
+@st.cache_resource
+def load_station_master_from_embedded() -> pd.DataFrame:
     df = pd.read_csv(StringIO(STATION_CSV))
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
@@ -812,12 +857,10 @@ def _haversine_vec(lat, lon, lats, lons):
     a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
     return 2.0 * R * np.arcsin(np.sqrt(a))
 
-def nearest_subway_from_master(lat: float, lon: float, stations: pd.DataFrame):
-    if stations is None or len(stations) == 0:
-        return None
+def nearest_station(lat: float, lon: float, stations: pd.DataFrame):
+    if stations is None or stations.empty: return None
     d = _haversine_vec(lat, lon, stations["lat"].to_numpy(), stations["lon"].to_numpy())
-    if d.size == 0 or np.all(np.isnan(d)):
-        return None
+    if d.size == 0 or np.all(np.isnan(d)): return None
     idx = int(np.nanargmin(d))
     return {
         "name": str(stations.at[idx,"name"]),
@@ -827,183 +870,122 @@ def nearest_subway_from_master(lat: float, lon: float, stations: pd.DataFrame):
         "dist": int(round(float(d[idx]))),
     }
 
-@st.cache_resource
-def stations(): return load_station_master_from_embedded()
-# =================================================================
-
-# ---------- Helpers ----------
+# ───────────────────────────
+# 유틸: 카테고리/지오코딩
+# ───────────────────────────
 def hash01_djb2(s: str) -> float:
     h = 5381
-    for ch in str(s):
-        h = ((h << 5) + h) + ord(ch)
+    for ch in str(s): h = ((h << 5) + h) + ord(ch)
     return float((h & 0xFFFFFFFF) / 0xFFFFFFFF)
 
 ENCODING = {"건물용도": {"단독다가구": 0, "아파트": 1, "연립다세대": 2, "오피스텔": 3}}
-
 def enc_category(name: str, raw: str) -> float:
     table = ENCODING.get(name)
     if table and raw in table: return float(table[raw])
     return hash01_djb2(raw)
 
-def geocode_address(q: str):
+def geocode_osm(q: str):
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"format":"jsonv2","limit":1,"addressdetails":1,"namedetails":1,"countrycodes":"kr","q":q}
+    params = {"format":"jsonv2","limit":1,"addressdetails":1,"countrycodes":"kr","q":q}
     headers = {"Accept":"application/json","Accept-Language":"ko","User-Agent":"jeonse-streamlit/1.0"}
-    r = requests.get(url, params=params, headers=headers, timeout=10); r.raise_for_status()
+    r = requests.get(url, params=params, headers=headers, timeout=15); r.raise_for_status()
     arr = r.json()
     if not arr: return None
     j = arr[0]
-    return {"lat": float(j["lat"]), "lon": float(j["lon"]),
-            "address": j.get("address", {}), "display_name": j.get("display_name","")}
-
-def reverse_geocode(lat: float, lon: float):
-    url = "https://nominatim.openstreetmap.org/reverse"
-    params = {"format":"jsonv2","lat":lat,"lon":lon,"addressdetails":1}
-    headers = {"Accept":"application/json","Accept-Language":"ko","User-Agent":"jeonse-streamlit/1.0"}
-    r = requests.get(url, params=params, headers=headers, timeout=10); r.raise_for_status()
-    return r.json()
+    return {"lat": float(j["lat"]), "lon": float(j["lon"]), "address": j.get("address", {}), "display": j.get("display_name","")}
 
 def parse_kr(address: dict):
     gu = address.get("county") or address.get("city_district") or address.get("borough") or address.get("city") or ""
     dong = address.get("suburb") or address.get("neighbourhood") or address.get("quarter") or address.get("village") or address.get("town") or ""
     return gu, dong
 
-@st.cache_resource
-def load_model_and_features(model_path: str = "jeonse_gbm_xgb.json"):
-    booster = xgb.Booster(); booster.load_model(model_path)
-    feat_names = booster.feature_names
-    # try parse json text
-    if not feat_names:
-        try:
-            txt = Path(model_path).read_text(encoding="utf-8")
-            m = json.loads(txt)
-            learner = m.get("learner") or m.get("Model", {}).get("learner", {})
-            feat_names = learner.get("feature_names") or learner.get("feature_names_")
-        except Exception:
-            feat_names = None
-    # sidecar fallback
-    if not feat_names:
-        for side in ["jeonse_gbm_xgb.flist","jeonse_gbm_xgb.features.txt","jeonse_gbm_features.csv"]:
-            p = Path(side)
-            if p.exists():
-                feat_names = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
-                break
-    return booster, feat_names
-
-# ---------- Session defaults ----------
+# ───────────────────────────
+# 세션 기본값
+# ───────────────────────────
 st.session_state.setdefault("lat", 37.5665)
 st.session_state.setdefault("lon", 126.9780)
 st.session_state.setdefault("gu", "")
 st.session_state.setdefault("dong", "")
 st.session_state.setdefault("addr_state", "")
 
-# ---------- UI ----------
-st.title("전세 보증금 예측")
-
+# ───────────────────────────
+# 입력 폼
+# ───────────────────────────
 with st.form("inputs"):
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        bldg = st.selectbox("건물용도", ["단독다가구","아파트","연립다세대","오피스텔"])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        bldg = st.selectbox("건물용도", ["단독다가구","아파트","연립다세대","오피스텔"], index=1)
         floor = st.number_input("층 수", value=3, step=1, min_value=-5, max_value=100)
         area = st.number_input("임대면적(㎡)", value=84.0, min_value=0.0, step=0.1)
-    with col2:
-        _ = st.text_input("집 주소", key="addr_input", value=st.session_state.get("addr_state",""))
+    with c2:
+        addr = st.text_input("주소(지오코딩)", value=st.session_state.get("addr_state","서울특별시 중구 세종대로 110"))
         contract = st.date_input("계약일", value=date.today(), format="YYYY-MM-DD")
         build_year = st.number_input("건축년도", value=2005, step=1, min_value=1900, max_value=2100)
-    with col3:
-        st.caption("지도 클릭 또는 주소 입력 → 좌표 반영")
-    run = st.form_submit_button("지도/좌표 업데이트")
+    with c3:
+        st.caption("주소로 좌표를 찾고 내장 역 목록으로 최근접 역/거리 계산")
+    run = st.form_submit_button("좌표/역 자동계산")
 
 if run:
-    st.session_state["addr_state"] = st.session_state.get("addr_input","").strip()
+    st.session_state.addr_state = addr.strip()
+    if st.session_state.addr_state:
+        g = geocode_osm(st.session_state.addr_state)
+        if g:
+            st.session_state.lat = g["lat"]; st.session_state.lon = g["lon"]
+            st.session_state.gu, st.session_state.dong = parse_kr(g["address"])
+            st.session_state.addr_state = g["display"] or st.session_state.addr_state
+            st.success(f"좌표: {st.session_state.lat:.6f}, {st.session_state.lon:.6f} | {st.session_state.gu} / {st.session_state.dong}")
+        else:
+            st.warning("주소 결과 없음")
 
-if run and st.session_state.get("addr_state",""):
-    g = geocode_address(st.session_state["addr_state"])
-    if g:
-        st.session_state.lat = g["lat"]; st.session_state.lon = g["lon"]
-        gu, dong = parse_kr(g.get("address", {}))
-        st.session_state.gu = gu; st.session_state.dong = dong
-        st.session_state["addr_state"] = g.get("display_name", st.session_state["addr_state"])
-        st.rerun()
-    else:
-        st.warning("주소 결과 없음")
-
-opt_col1, opt_col2 = st.columns([1,1])
-with opt_col1:
-    show_subway = st.checkbox("지하철역 표시", value=True)
-with opt_col2:
-    radius_km = st.slider("역 표시 반경(km)", 1, 15, 5)
-
+# ───────────────────────────
+# 지도 표시
+# ───────────────────────────
 cur_lat = float(st.session_state.lat); cur_lon = float(st.session_state.lon)
-subway = nearest_subway_from_master(cur_lat, cur_lon, stations())
+stations_df = load_station_master_from_embedded()
+near = nearest_station(cur_lat, cur_lon, stations_df)
 
-m = folium.Map(location=[cur_lat, cur_lon], zoom_start=16, control_scale=True)
+m = folium.Map(location=[cur_lat, cur_lon], zoom_start=15, control_scale=True)
 folium.Marker([cur_lat, cur_lon], tooltip="선택 지점",
               icon=folium.Icon(color="blue", icon="home", prefix="fa")).add_to(m)
 
-if show_subway:
-    st_df = stations()
-    if len(st_df):
-        dists = _haversine_vec(cur_lat, cur_lon, st_df["lat"].to_numpy(), st_df["lon"].to_numpy())
-        near_df = st_df[dists <= (radius_km*1000)].reset_index(drop=True)
-        fg = folium.FeatureGroup(name=f"지하철역(반경 {radius_km}km)", show=True)
-        cluster = MarkerCluster().add_to(fg)
-        for _, r in near_df.iterrows():
-            folium.CircleMarker([r["lat"], r["lon"]], radius=3, color="#2c7be5", fill=True, fill_opacity=0.9,
-                                popup=f"{r['name']}<br/>{r['line']}").add_to(cluster)
-        fg.add_to(m)
-
-if subway:
-    folium.Marker([subway["lat"], subway["lon"]],
-                  tooltip=f"최근접 역: {subway['name']} ({subway['line']})",
+if near:
+    folium.Marker([near["lat"], near["lon"]],
+                  tooltip=f"최근접 역: {near['name']} ({near['line']})",
                   icon=folium.Icon(color="red", icon="train", prefix="fa")).add_to(m)
-    folium.PolyLine([[cur_lat, cur_lon], [subway["lat"], subway["lon"]]], color="red", weight=2, opacity=0.7).add_to(m)
+    folium.PolyLine([[cur_lat, cur_lon], [near["lat"], near["lon"]]], color="red", weight=2, opacity=0.7).add_to(m)
 
-folium.LayerControl(collapsed=False).add_to(m)
-map_data = st_folium(m, height=480, width=None, returned_objects=["last_clicked"])
+st_folium(m, height=430, width=None)
 
-if map_data and map_data.get("last_clicked"):
-    click_lat = float(map_data["last_clicked"]["lat"])
-    click_lon = float(map_data["last_clicked"]["lng"])
-    st.session_state.lat = click_lat; st.session_state.lon = click_lon
-    try:
-        r = reverse_geocode(click_lat, click_lon)
-        gu, dong = parse_kr(r.get("address", {}))
-        st.session_state.gu = gu; st.session_state.dong = dong
-        disp = r.get("display_name") or ""
-        if disp: st.session_state["addr_state"] = disp
-        st.rerun()
-    except Exception as e:
-        st.info(f"역지오코딩 실패: {e}")
-
-recv_year = contract.year; recv_month = contract.month
+# ───────────────────────────
+# 자동 파생값 표시
+# ───────────────────────────
+recv_year = contract.year
 bldg_age = recv_year - int(build_year)
+st.info(
+    f"자치구/동: {st.session_state.gu or '-'} / {st.session_state.dong or '-'}   ·   "
+    f"최근접 지하철: {near['name']} ({near['line']}) / {near['dist']} m" if near else "최근접 지하철: -"
+)
 
-st.subheader("자동 파생값")
-c1, c2, c3, c4 = st.columns(4)
-with c1: st.metric("좌표", f"{cur_lat:.6f}, {cur_lon:.6f}")
-with c2: st.metric("자치구 / 행정동", f"{st.session_state.gu or '-'} / {st.session_state.dong or '-'}")
-with c3: st.metric("접수년도 / 건물연령", f"{recv_year} / {bldg_age}")
-with c4:
-    if subway:
-        st.metric("최근접 지하철", f"{subway['name']} ({subway['line'] or '알 수 없음'})")
-        st.caption(f"직선거리: {subway['dist']} m")
-    else:
-        st.metric("최근접 지하철", "-")
+# ───────────────────────────
+# 예측 실행
+# ───────────────────────────
+model = load_model()
+feat_names = get_feature_names_from_booster(model)
 
 st.divider()
-left, right = st.columns([1,1])
+if st.button("예측하기"):
+    if not feat_names:
+        st.error("모델 feature_names를 찾지 못했습니다. 'jeonse_gbm_xgb.flist' 등을 같은 폴더에 두거나 모델에 내장하세요.")
+        st.stop()
 
-with left:
-    st.subheader("예측 실행")
     feat = {
         "건물용도": enc_category("건물용도", bldg),
         "임대면적": float(area),
         "동_norm": hash01_djb2(st.session_state.dong or ""),
         "구_norm": hash01_djb2(st.session_state.gu or ""),
         "건축년도": int(build_year),
-        "최근접_지하철역": hash01_djb2(subway["name"]) if subway else 0.0,
-        "최근접_호선": hash01_djb2(subway["line"]) if subway else 0.0,
+        "최근접_지하철역": hash01_djb2(near["name"]) if near else 0.0,
+        "최근접_호선": hash01_djb2(near["line"]) if near else 0.0,
         "계약일": int(f"{contract.year}{contract.month:02d}{contract.day:02d}"),
         "계약일_year": int(contract.year),
         "계약일_month": int(contract.month),
@@ -1012,52 +994,24 @@ with left:
         "건물연령": int(bldg_age),
         "층": int(floor),
         "접수년도": int(contract.year),
-        "지하철역까지 직선거리": int(subway["dist"]) if subway else 0,
+        "지하철역까지 직선거리": int(near["dist"]) if near else 0,
     }
-    st.code(json.dumps(feat, ensure_ascii=False, indent=2), language="json")
-    predict_clicked = st.button("예측하기")
 
-    if predict_clicked:
-        booster, model_feat_names = load_model_and_features("jeonse_gbm_xgb.json")
+    df = pd.DataFrame([feat]).astype(np.float32)
 
-        df = pd.DataFrame([feat]).astype(np.float32)
+    missing = [c for c in feat_names if c not in df.columns]
+    extra   = [c for c in df.columns if c not in feat_names]
+    if missing:
+        st.error(f"모델이 요구하는 피처 누락: {missing}")
+        if extra: st.info(f"모델에 없는 추가 피처: {extra}")
+        st.stop()
 
-        # 강제 정렬 경로 선택
-        if not model_feat_names:
-            st.error("모델에 feature_names가 포함되어 있지 않습니다. 동일 폴더에 'jeonse_gbm_xgb.flist' 또는 'jeonse_gbm_xgb.features.txt'를 두세요.")
-            st.stop()
+    X = df.reindex(columns=feat_names)
+    dmat = xgb.DMatrix(X, feature_names=feat_names)
+    y = model.predict(dmat)
+    y_val = float(y[0])
 
-        missing = [c for c in model_feat_names if c not in df.columns]
-        extra   = [c for c in df.columns if c not in model_feat_names]
-        if missing:
-            st.error(f"모델이 요구하는 피처 누락: {missing}")
-            if extra: st.info(f"모델에 없는 추가 피처: {extra}")
-            st.stop()
+    st.success(f"예측 전세 보증금: {int(round(y_val)):,} 만원")
 
-        X = df.reindex(columns=model_feat_names)   # 정확히 모델 학습 순서로 정렬
-        dmatrix = xgb.DMatrix(X, feature_names=model_feat_names)
-
-        y = booster.predict(dmatrix)
-        y_val = float(y[0])          # 모델 원출력
-        y_10k = y_val if y_val > 100 else y_val/1.0  # 단위 변환 없음(학습 단위 가정: '만원')
-
-        st.success(f"예측 전세 보증금: {int(round(y_10k)):,} 만원")
-
-        # 디버그
-        try:
-            cfg = json.loads(booster.save_config())
-            base_score = float(cfg["learner"]["learner_model_param"]["base_score"])
-            st.caption(f"디버그: raw_pred={y_val:.3f}, base_score={base_score:.3f}, 사용 피처 수={len(model_feat_names)}")
-        except Exception:
-            st.caption(f"디버그: raw_pred={y_val:.3f}, 사용 피처 수={len(model_feat_names)}")
-
-with right:
-    st.subheader("입력 데이터 미리보기")
-    st.dataframe(pd.DataFrame([{
-        "건물용도": bldg, "임대면적": area, "구_norm": st.session_state.gu, "동_norm": st.session_state.dong,
-        "계약일": contract.isoformat(), "계약일_year": recv_year, "계약일_month": recv_month,
-        "건축년도": build_year, "건물연령": bldg_age, "층": floor,
-        "lat": cur_lat, "lon": cur_lon,
-        "최근접 지하철": subway["name"] if subway else "", "최근접 호선": subway["line"] if subway else "",
-        "지하철 직선거리": subway["dist"] if subway else "", "접수년도": recv_year,
-    }]))
+    with st.expander("입력 피처 미리보기"):
+        st.code(json.dumps(feat, ensure_ascii=False, indent=2), language="json")
