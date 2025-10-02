@@ -1046,13 +1046,13 @@ st.info(
 # ───────────────────────────
 # 예측 실행
 # ───────────────────────────
-with st.spinner("모델 로드 중…"):
-    model = load_model()
-feat_names = get_feature_names_from_booster(model)
 
 st.divider()
 if st.button("예측하기"):
     if not feat_names:
+        with st.spinner("모델 로드 중…"):
+            model = load_model()
+        feat_names = get_feature_names_from_booster(model)
         st.error("모델 feature_names를 찾지 못했습니다. 'jeonse_gbm_xgb.flist' 등을 같은 폴더에 두거나 모델에 내장하세요.")
         st.stop()
 
