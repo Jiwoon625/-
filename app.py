@@ -3,11 +3,14 @@
 from datetime import date
 from io import StringIO
 from pathlib import Path
-import gzip, json, shutil, math
+import os, gzip, json, shutil, math
 
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
@@ -15,7 +18,7 @@ from folium.plugins import MarkerCluster
 import xgboost as xgb
 
 # ───────────────────────────
-# 페이지 설정 (가장 먼저 호출)
+# 페이지 설정
 # ───────────────────────────
 st.set_page_config(page_title="적정 전세 보증금 예측", layout="wide")
 st.title("적정 전세 보증금 예측")
@@ -30,7 +33,7 @@ UBJ_PATH = MODEL_DIR / "jeonse_gbm_xgb.ubj"
 
 def _download_if_needed():
     if not GZ_PATH.exists() or GZ_PATH.stat().st_size == 0:
-        with st.status("모델 다운로드 중...", expanded=False) as s:
+        with st.status("모델 다운로드 중…", expanded=False) as s:
             with requests.get(MODEL_URL, stream=True, timeout=300) as r:
                 r.raise_for_status()
                 tmp = GZ_PATH.with_suffix(".part")
@@ -38,7 +41,7 @@ def _download_if_needed():
                     for chunk in r.iter_content(1024*1024):
                         if chunk: f.write(chunk)
                 tmp.replace(GZ_PATH)
-            s.update(label="다운로드 완료", state="complete")
+            s.update(label="모델 다운로드 완료", state="complete")
 
     if not UBJ_PATH.exists() or UBJ_PATH.stat().st_size == 0:
         with gzip.open(GZ_PATH, "rb") as fin, open(UBJ_PATH, "wb") as fout:
@@ -849,6 +852,9 @@ def load_station_master_from_embedded() -> pd.DataFrame:
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
     return df.dropna(subset=["lat","lon"]).reset_index(drop=True)
 
+# ───────────────────────────
+# 거리/최근접역
+# ───────────────────────────
 def _haversine_vec(lat, lon, lats, lons):
     R = 6371000.0
     lat1 = np.radians(lat); lon1 = np.radians(lon)
@@ -871,7 +877,7 @@ def nearest_station(lat: float, lon: float, stations: pd.DataFrame):
     }
 
 # ───────────────────────────
-# 유틸: 카테고리/지오코딩
+# 유틸: 카테고리/인코딩
 # ───────────────────────────
 def hash01_djb2(s: str) -> float:
     h = 5381
@@ -884,15 +890,77 @@ def enc_category(name: str, raw: str) -> float:
     if table and raw in table: return float(table[raw])
     return hash01_djb2(raw)
 
-def geocode_osm(q: str):
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"format":"jsonv2","limit":1,"addressdetails":1,"countrycodes":"kr","q":q}
-    headers = {"Accept":"application/json","Accept-Language":"ko","User-Agent":"jeonse-streamlit/1.0"}
-    r = requests.get(url, params=params, headers=headers, timeout=15); r.raise_for_status()
-    arr = r.json()
-    if not arr: return None
-    j = arr[0]
-    return {"lat": float(j["lat"]), "lon": float(j["lon"]), "address": j.get("address", {}), "display": j.get("display_name","")}
+# ───────────────────────────
+# 네트워크 세션/지오코딩(예외·리트라이·폴백)
+# ───────────────────────────
+def _session_with_retry(total=3, backoff=1.5) -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=total, connect=total, read=total,
+        backoff_factor=backoff,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    return s
+
+def _contact_email() -> str:
+    # Nominatim 권고: 식별 가능한 UA + 연락 이메일
+    return os.getenv("CONTACT_EMAIL") or st.secrets.get("CONTACT_EMAIL", "contact@example.com")
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def geocode_osm_cached(q: str):
+    try:
+        s = _session_with_retry()
+        headers = {
+            "Accept": "application/json",
+            "Accept-Language": "ko",
+            "User-Agent": f"jeonse-streamlit/1.0 (+mailto:{_contact_email()})"
+        }
+        params = {"format":"jsonv2","limit":1,"addressdetails":1,"countrycodes":"kr","q":q}
+        r = s.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=8)
+        r.raise_for_status()
+        arr = r.json()
+        if not arr: return None
+        j = arr[0]
+        return {"lat": float(j["lat"]), "lon": float(j["lon"]), "address": j.get("address", {}), "display": j.get("display_name","")}
+    except requests.RequestException:
+        return None
+
+def _kakao_key():
+    # Streamlit Cloud에서는 st.secrets 사용 권장
+    return st.secrets.get("KAKAO_REST_KEY") or os.getenv("KAKAO_REST_KEY")
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def geocode_kakao_cached(q: str):
+    key = _kakao_key()
+    if not key: return None
+    try:
+        s = _session_with_retry()
+        r = s.get(
+            "https://dapi.kakao.com/v2/local/search/address.json",
+            params={"query": q},
+            headers={"Authorization": f"KakaoAK {key}"},
+            timeout=8
+        )
+        r.raise_for_status()
+        docs = r.json().get("documents", [])
+        if not docs: return None
+        d = docs[0]
+        return {
+            "lat": float(d["y"]), "lon": float(d["x"]),
+            "address": {}, "display": d.get("address_name","")
+        }
+    except requests.RequestException:
+        return None
+
+def geocode(q: str):
+    g = geocode_osm_cached(q)
+    if g: return g, "OSM"
+    g = geocode_kakao_cached(q)
+    if g: return g, "Kakao"
+    return None, None
 
 def parse_kr(address: dict):
     gu = address.get("county") or address.get("city_district") or address.get("borough") or address.get("city") or ""
@@ -922,20 +990,29 @@ with st.form("inputs"):
         contract = st.date_input("계약일", value=date.today(), format="YYYY-MM-DD")
         build_year = st.number_input("건축년도", value=2005, step=1, min_value=1900, max_value=2100)
     with c3:
-        st.caption("주소로 좌표를 찾고 내장 역 목록으로 최근접 역/거리 계산")
+        st.caption("주소→좌표 시도 후 실패하면 수동 좌표 입력으로 전환")
     run = st.form_submit_button("좌표/역 자동계산")
 
+# ───────────────────────────
+# 지오코딩 (비차단, 폴백 포함)
+# ───────────────────────────
 if run:
     st.session_state.addr_state = addr.strip()
     if st.session_state.addr_state:
-        g = geocode_osm(st.session_state.addr_state)
+        with st.spinner("주소 지오코딩 중…"):
+            g, src = geocode(st.session_state.addr_state)
         if g:
             st.session_state.lat = g["lat"]; st.session_state.lon = g["lon"]
             st.session_state.gu, st.session_state.dong = parse_kr(g["address"])
             st.session_state.addr_state = g["display"] or st.session_state.addr_state
-            st.success(f"좌표: {st.session_state.lat:.6f}, {st.session_state.lon:.6f} | {st.session_state.gu} / {st.session_state.dong}")
+            st.success(f"좌표: {st.session_state.lat:.6f}, {st.session_state.lon:.6f} · 소스: {src}")
         else:
-            st.warning("주소 결과 없음")
+            st.warning("지오코딩 실패. 아래에서 좌표를 직접 입력하세요.")
+
+# 지오코딩 실패 시 수동 입력 제공
+with st.expander("좌표 수동 입력", expanded=False):
+    st.session_state.lat = st.number_input("위도", value=float(st.session_state.lat), format="%.6f")
+    st.session_state.lon = st.number_input("경도", value=float(st.session_state.lon), format="%.6f")
 
 # ───────────────────────────
 # 지도 표시
@@ -969,7 +1046,8 @@ st.info(
 # ───────────────────────────
 # 예측 실행
 # ───────────────────────────
-model = load_model()
+with st.spinner("모델 로드 중…"):
+    model = load_model()
 feat_names = get_feature_names_from_booster(model)
 
 st.divider()
