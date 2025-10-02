@@ -55,12 +55,28 @@ def load_model() -> xgb.Booster:
     return bst
 
 def get_feature_names_from_booster(bst: xgb.Booster):
+    # 1) 모델에 내장되어 있으면 그대로 사용
     if getattr(bst, "feature_names", None):
         return list(bst.feature_names)
-    for side in ["jeonse_gbm_xgb.flist", "jeonse_gbm_xgb.features.txt", "jeonse_gbm_features.csv"]:
-        p = Path(side)
+
+    # 2) 파일에서 탐색 (여러 후보 경로)
+    app_dir = Path(__file__).parent
+    candidates = [
+        Path("jeonse_gbm_xgb.flist"),
+        Path("jeonse_gbm_xgb.features.txt"),
+        Path("jeonse_gbm_features.csv"),
+        app_dir / "jeonse_gbm_xgb.flist",
+        app_dir / "jeonse_gbm_xgb.features.txt",
+        app_dir / "jeonse_gbm_features.csv",
+        MODEL_DIR / "jeonse_gbm_features.csv",
+    ]
+    for p in candidates:
         if p.exists():
-            return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            lines = p.read_text(encoding="utf-8").splitlines()
+            cols = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+            return cols
+
+    # 3) 못 찾으면 None
     return None
 
 STATION_CSV = r"""name,line,lat,lon
@@ -1014,6 +1030,44 @@ with st.expander("좌표 수동 입력", expanded=False):
     st.session_state.lat = st.number_input("위도", value=float(st.session_state.lat), format="%.6f")
     st.session_state.lon = st.number_input("경도", value=float(st.session_state.lon), format="%.6f")
 
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def reverse_osm(lat: float, lon: float):
+    try:
+        s = _session_with_retry()
+        headers = {
+            "Accept": "application/json",
+            "Accept-Language": "ko",
+            "User-Agent": f"jeonse-streamlit/1.0 (+mailto:{_contact_email()})",
+        }
+        params = {"format": "jsonv2", "lat": lat, "lon": lon, "addressdetails": 1}
+        r = s.get("https://nominatim.openstreetmap.org/reverse", params=params, headers=headers, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        return {"address": j.get("address", {}), "display": j.get("display_name", "")}
+    except requests.RequestException:
+        return None
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def reverse_kakao(lat: float, lon: float):
+    key = _kakao_key()
+    if not key: return None
+    try:
+        s = _session_with_retry()
+        r = s.get(
+            "https://dapi.kakao.com/v2/local/geo/coord2address.json",
+            params={"x": lon, "y": lat},
+            headers={"Authorization": f"KakaoAK {key}"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        docs = r.json().get("documents", [])
+        if not docs: return None
+        display = (docs[0].get("address") or {}).get("address_name", "")
+        return {"address": {}, "display": display}
+    except requests.RequestException:
+        return None
+
+
 # ───────────────────────────
 # 지도 표시
 # ───────────────────────────
@@ -1031,7 +1085,20 @@ if near:
                   icon=folium.Icon(color="red", icon="train", prefix="fa")).add_to(m)
     folium.PolyLine([[cur_lat, cur_lon], [near["lat"], near["lon"]]], color="red", weight=2, opacity=0.7).add_to(m)
 
-st_folium(m, height=430, width=None)
+m_out = st_folium(m, height=430, width=None)
+
+# 지도 클릭 → 좌표 반영 + 역지오코딩
+if m_out and m_out.get("last_clicked"):
+    lat = float(m_out["last_clicked"]["lat"])
+    lon = float(m_out["last_clicked"]["lng"])
+    st.session_state.lat = lat
+    st.session_state.lon = lon
+
+    rg = reverse_osm(lat, lon) or reverse_kakao(lat, lon) or {}
+    st.session_state.addr_state = rg.get("display", f"{lat:.6f}, {lon:.6f}")
+    st.session_state.gu, st.session_state.dong = parse_kr(rg.get("address", {}))
+    st.success(f"지도 클릭 좌표 적용: {lat:.6f}, {lon:.6f}")
+
 
 # ───────────────────────────
 # 자동 파생값 표시
@@ -1048,11 +1115,17 @@ st.info(
 # ───────────────────────────
 
 st.divider()
+
 if st.button("예측하기"):
+    # 1) 먼저 모델 로드
+    with st.spinner("모델 로드 중…"):
+        model = load_model()
+
+    # 2) 그 다음 feature_names 추출
+    feat_names = get_feature_names_from_booster(model) or []
+
+    # 3) 없으면 에러 처리
     if not feat_names:
-        with st.spinner("모델 로드 중…"):
-            model = load_model()
-        feat_names = get_feature_names_from_booster(model)
         st.error("모델 feature_names를 찾지 못했습니다. 'jeonse_gbm_xgb.flist' 등을 같은 폴더에 두거나 모델에 내장하세요.")
         st.stop()
 
