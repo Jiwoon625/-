@@ -31,18 +31,20 @@ MODEL_DIR = Path("models"); MODEL_DIR.mkdir(exist_ok=True)
 GZ_PATH = MODEL_DIR / "jeonse_gbm_xgb.ubj.gz"
 UBJ_PATH = MODEL_DIR / "jeonse_gbm_xgb.ubj"
 
+# 모델 다운로드(무표시, 안전한 덮어쓰기)
 def _download_if_needed():
+    # 1) gz 없으면 다운로드
     if not GZ_PATH.exists() or GZ_PATH.stat().st_size == 0:
-        with st.status("모델 다운로드 중…", expanded=False) as s:
-            with requests.get(MODEL_URL, stream=True, timeout=300) as r:
-                r.raise_for_status()
-                tmp = GZ_PATH.with_suffix(".part")
-                with open(tmp, "wb") as f:
-                    for chunk in r.iter_content(1024*1024):
-                        if chunk: f.write(chunk)
-                tmp.replace(GZ_PATH)
-            s.update(label="모델 다운로드 완료", state="complete")
+        with requests.get(MODEL_URL, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            tmp = GZ_PATH.with_suffix(".part")
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            tmp.replace(GZ_PATH)
 
+    # 2) ubj 없으면 해제
     if not UBJ_PATH.exists() or UBJ_PATH.stat().st_size == 0:
         with gzip.open(GZ_PATH, "rb") as fin, open(UBJ_PATH, "wb") as fout:
             shutil.copyfileobj(fin, fout)
@@ -1105,10 +1107,9 @@ if m_out and m_out.get("last_clicked"):
 # ───────────────────────────
 recv_year = contract.year
 bldg_age = recv_year - int(build_year)
-st.info(
-    f"자치구/동: {st.session_state.gu or '-'} / {st.session_state.dong or '-'}   ·   "
-    f"최근접 지하철: {near['name']} ({near['line']}) / {near['dist']} m" if near else "최근접 지하철: -"
-)
+info_text = (f"최근접 지하철: {near['name']} ({near['line']}) / {near['dist']} m"
+             if near else "최근접 지하철: -")
+st.info(info_text)
 
 # ───────────────────────────
 # 예측 실행
@@ -1166,3 +1167,4 @@ if st.button("예측하기"):
 
     with st.expander("입력 피처 미리보기"):
         st.code(json.dumps(feat, ensure_ascii=False, indent=2), language="json")
+
