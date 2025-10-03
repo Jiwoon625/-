@@ -1,0 +1,8 @@
+streamlit>=1.37
+xgboost>=1.7
+pandas>=2.1
+numpy>=1.26
+requests>=2.32
+folium>=0.17
+streamlit-folium>=0.21
+requests>=2.31.0,<3
